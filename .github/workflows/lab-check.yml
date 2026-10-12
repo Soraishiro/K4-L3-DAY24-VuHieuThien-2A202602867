@@ -1,0 +1,36 @@
+name: Day24 lab verification
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install requirements
+        run: python -m pip install --require-hashes -r requirements.lock
+      - name: Test all required and regression cases
+        run: python -m pytest tests/ -q -s
+      - name: Check four injection variants
+        run: python -m agent.check_lure 'corpus/ticket-90*.md'
+      - name: Replay local synthetic evidence
+        run: python scripts/replay_evidence.py
+      - name: Upload regenerated evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab24-evidence
+          if-no-files-found: warn
+          path: |
+            reports/attack-before.log
+            reports/attack-after.log
+            reports/ledger.jsonl
+            reports/replay-summary.json
