@@ -1,0 +1,22 @@
+[
+  {
+    "variant": 1,
+    "baseline_exfiltration": true
+  },
+  {
+    "variant": 2,
+    "baseline_exfiltration": true
+  },
+  {
+    "variant": 3,
+    "baseline_exfiltration": true
+  },
+  {
+    "variant": 4,
+    "baseline_exfiltration": true
+  },
+  {
+    "containment": "pass",
+    "ledger_entries": 23
+  }
+]
