@@ -1,48 +1,74 @@
-"""BƯỚC 3d — audit ledger append-only, tamper-evident (10').
-
-JSONL, mỗi tool call một dòng. Đọc CHECKPOINTS.md (§3d).
-
-Interface bắt buộc (tests/test_ledger.py và agent/runner.py gọi trực tiếp):
-
-    append(entry: dict, path: pathlib.Path) -> dict
-        `entry` phải có tối thiểu các field:
-            ts, agent_id, run_id, tool, args_hash, classification,
-            decision, reason
-        Hàm tự thêm 2 field:
-            prev_hash  = hash của dòng ngay trước trong file này, hoặc
-                         "0" * 64 nếu là dòng đầu tiên
-            hash       = sha256 tính từ nội dung dòng NÀY (bao gồm cả
-                         prev_hash, KHÔNG bao gồm field hash) — dùng
-                         json.dumps(..., sort_keys=True) trước khi hash
-                         để thứ tự field không ảnh hưởng kết quả.
-        Append 1 dòng JSON (utf-8, ensure_ascii=False) vào cuối `path`,
-        tạo file/thư mục cha nếu chưa có. Trả về dict đầy đủ đã ghi
-        (bao gồm prev_hash/hash).
-
-    verify(path: pathlib.Path) -> bool
-        Đọc toàn bộ file, trả về True nếu TẤT CẢ đều đúng:
-          - mọi dòng có `reason` non-empty
-          - prev_hash của dòng n == hash đã lưu của dòng n-1 (dòng đầu so
-            với "0" * 64)
-          - hash lưu trong dòng n khớp lại khi tính lại từ nội dung dòng đó
-        Trả về False nếu một dòng còn trong file bị sửa mà không tính lại
-        hash, nếu xoá/chèn giữa file làm đứt liên kết, hoặc thiếu reason.
-        Chỉ kiểm tra file hiện có KHÔNG phát hiện được việc xoá dòng cuối
-        hoặc viết lại cả file và tính lại chuỗi. Muốn phát hiện cắt đuôi
-        phải lưu hash/số dòng cuối ở một nơi tin cậy bên ngoài file rồi
-        đối chiếu. Bài lab không cung cấp mốc đó.
-
-Sinh viên phải tự tay chứng minh được: sửa 1 ký tự trong 1 dòng giữa file
-rồi gọi verify() phải trả về False.
-"""
+"""Audit ledger with hash chain"""
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
+from typing import Dict
 
 
-def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+def _compute_hash(payload: dict) -> str:
+    h = hashlib.sha256()
+    h.update(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    return h.hexdigest()
+
+
+def append(entry: dict, path: Path) -> Dict:
+    """Append entry to ledger with hash chain. Returns full entry with hashes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prev_hash = "0" * 64
+    if path.exists():
+        # read last line
+        try:
+            content = path.read_text(encoding="utf-8").rstrip()
+            if content:
+                lines = content.splitlines()
+                if lines:
+                    last = json.loads(lines[-1])
+                    prev_hash = last.get("hash", "0" * 64)
+        except Exception:
+            prev_hash = "0" * 64
+    rec = dict(entry)
+    if "reason" not in rec:
+        rec["reason"] = ""
+    rec["prev_hash"] = prev_hash
+    # compute hash from rec without hash field
+    to_hash = dict(rec)
+    if "hash" in to_hash:
+        to_hash.pop("hash")
+    rec["hash"] = _compute_hash(to_hash)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+    return rec
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    """Verify ledger file integrity."""
+    if not path.exists():
+        return True
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+    if not content.strip():
+        return True
+    lines = content.splitlines()
+    prev_hash = "0" * 64
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            return False
+        if not rec.get("reason"):
+            return False
+        if rec.get("prev_hash") != prev_hash:
+            return False
+        to_hash = dict(rec)
+        h = to_hash.pop("hash", None)
+        calc = _compute_hash(to_hash)
+        if h != calc:
+            return False
+        prev_hash = calc
+    return True

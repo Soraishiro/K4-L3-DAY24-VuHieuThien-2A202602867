@@ -1,40 +1,11 @@
-"""BƯỚC 3b — PEP (Policy Enforcement Point) tại tool call (15').
-
-Cổng chặn TRƯỚC KHI tool thật sự execute. Đọc CHECKPOINTS.md (§3b).
-
-Interface bắt buộc (tests/test_policy.py và agent/runner.py gọi trực tiếp):
-
-    check(context: PolicyContext) -> tuple[bool, str]
-        Trả về (allow, reason).
-        `reason` KHÔNG BAO GIỜ được để trống — cả khi allow=True và
-        allow=False. Đây là evidence audit ở Bước 4 (rubric: "Audit
-        completeness = 100%" — điều kiện trượt nếu có dòng thiếu reason).
-
-PolicyContext — 5 input gốc và các input OBO cho lớp L3:
-
-    data_classification: str   "public" | "internal" | "restricted"
-    request_purpose: str       tự do, ví dụ "reconciliation", "support-reply"
-    agent_owner: str            định danh agent/run gọi tool này
-    delegation_depth: int       0 = gọi trực tiếp bởi user, >0 = agent gọi agent
-    egress_enabled: bool        run hiện tại có được phép gọi network không
-    principal_id: str           ID người ra lệnh từ data/principals.json
-    requested_tool: str         tool sắp gọi
-    agent_scopes: tuple[str]    quyền tối đa của agent
-    parent_scopes: tuple[str]   quyền của agent cha khi delegation_depth > 0
-    expires_at: str             ISO-8601 UTC; hết hạn phải deny
-
-Rule TỐI THIỂU bắt buộc (không được viết yếu hơn rule này):
-
-    classification == "restricted" and egress_enabled is True  ->  DENY
-
-Checkpoint OBO: quyền hiệu lực = principal.allowed_tools ∩ agent_scopes,
-và nếu depth > 0 thì còn giao với parent_scopes. Unknown principal, scope
-thiếu, run hết hạn đều deny kèm reason. Principal là fixture mô phỏng,
-không phải xác thực người dùng production.
-"""
+"""Policy enforcement point for tool calls"""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Tuple
 
 
 @dataclass(frozen=True)
@@ -51,5 +22,55 @@ class PolicyContext:
     expires_at: str = ""
 
 
-def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+_PRINCIPALS_FILE = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+
+
+def _load_principal(pid: str) -> dict | None:
+    try:
+        data = json.loads(_PRINCIPALS_FILE.read_text(encoding="utf-8"))
+        return data.get(pid)
+    except Exception:
+        return None
+
+
+def _is_expired(expires_at: str) -> bool:
+    if not expires_at:
+        return False
+    try:
+        dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt < datetime.now(timezone.utc)
+    except Exception:
+        return True
+
+
+def check(context: PolicyContext) -> Tuple[bool, str]:
+    # Minimum deny rule: restricted + egress
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data with egress is not permitted"
+
+    # OBO checks if principal specified
+    if context.principal_id:
+        p = _load_principal(context.principal_id)
+        if p is None:
+            return False, f"unknown principal: {context.principal_id}"
+        allowed_tools = set(p.get("allowed_tools", []))
+        purposes = set(p.get("purposes", []))
+        # build effective scopes
+        effective = set(context.agent_scopes or [])
+        effective &= allowed_tools
+        if context.delegation_depth > 0:
+            effective &= set(context.parent_scopes or [])
+        if not effective:
+            return False, "no effective scope for requested tool"
+        if context.requested_tool and context.requested_tool not in effective:
+            return False, f"tool not allowed for principal {context.principal_id}"
+        if context.request_purpose and context.request_purpose not in purposes:
+            return False, f"purpose not allowed for principal {context.principal_id}"
+        if _is_expired(context.expires_at):
+            return False, "principal/session expired"
+
+    return True, "policy check passed"

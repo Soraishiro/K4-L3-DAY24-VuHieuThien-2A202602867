@@ -1,39 +1,64 @@
-"""BƯỚC 3a — PII gate TRƯỚC KHI vào context/store (12').
-
-Đọc CHECKPOINTS.md (§3a) trước khi bắt đầu: Presidio không có tiếng Việt
-sẵn (AnalyzerEngine() mặc định chỉ hỗ trợ "en"). Đường an toàn cho 2h là
-regex recognizer + deny-list cho PERSON — coi spaCy/transformers NER là
-stretch goal, KHÔNG bắt buộc.
-
-Interface bắt buộc (tests/test_pii.py gọi trực tiếp 2 hàm này):
-
-    detect(text: str) -> list[dict]
-        Mỗi entity: {"type": str, "start": int, "end": int}
-        `type` là một trong: "VN_CCCD", "VN_PHONE", "VN_BANK_ACCOUNT", "EMAIL"
-        `start`/`end` là offset ký tự trong `text` (offset đầu bao gồm,
-        offset cuối KHÔNG bao gồm — giống slice Python text[start:end]).
-        Format này khớp với tests/vn_pii_testset.jsonl.
-
-    redact(text: str) -> str
-        Trả về `text` sau khi mọi entity từ detect() bị thay bằng
-        "[REDACTED_<TYPE>]". Phải xử lý overlap/thứ tự đúng khi có nhiều
-        entity (gợi ý: thay từ cuối văn bản về đầu để offset không bị lệch).
-
-Gợi ý định dạng (không bắt buộc đúng regex này, miễn đạt ngưỡng trên test
-set ở tests/vn_pii_testset.jsonl):
-    VN_CCCD          12 chữ số liên tiếp
-    VN_PHONE         0 + 9-10 chữ số, có thể có dấu cách/gạch ngang
-    VN_BANK_ACCOUNT  8-16 chữ số liên tiếp, thường đi kèm "STK"/"số tài khoản"
-    EMAIL            dạng chuẩn local@domain.tld
-
-Đo bằng: pytest tests/test_pii.py -v -s   (in ra precision/recall)
-"""
+"""PII detection and redaction for Vietnamese PII"""
 from __future__ import annotations
 
+import re
+from typing import List, Dict
 
-def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+
+def detect(text: str) -> List[Dict]:
+    """Detect VN PII entities."""
+    entities = []
+    bank_spans = []
+
+    # VN_BANK_ACCOUNT: 8-16 digits after context keywords (highest priority)
+    for m in re.finditer(r'(?:STK|stk|số tài khoản|so tai khoan|tài khoản|tai khoan)\s*(\d{8,16})\b', text, re.I):
+        s, e = m.start(1), m.end(1)
+        bank_spans.append((s, e))
+        entities.append({"type": "VN_BANK_ACCOUNT", "start": s, "end": e})
+
+    # VN_BANK_ACCOUNT: standalone 13-16 digit numbers (not overlapping with keyword matches)
+    for m in re.finditer(r'(\d{13,16})\b', text):
+        s, e = m.start(1), m.end(1)
+        if any(s < bs[1] and bs[0] < e for bs in bank_spans):
+            continue
+        dup = any(o['start'] == s and o['end'] == e and o['type'] == "VN_BANK_ACCOUNT" for o in entities)
+        if not dup:
+            entities.append({"type": "VN_BANK_ACCOUNT", "start": s, "end": e})
+            bank_spans.append((s, e))
+
+    # VN_CCCD: 12 consecutive digits (not overlapping with bank accounts)
+    for m in re.finditer(r'\b(\d{12})\b', text):
+        s, e = m.start(1), m.end(1)
+        if any(s < bs[1] and bs[0] < e for bs in bank_spans):
+            continue
+        entities.append({"type": "VN_CCCD", "start": s, "end": e})
+
+    # VN_PHONE: 10-digit number starting with 0 (not overlapping with bank/CCCD)
+    cccd_spans = [(e['start'], e['end']) for e in entities if e['type'] == 'VN_CCCD']
+    occupied = bank_spans + cccd_spans
+    for m in re.finditer(r'(?:[^\d]|^)(0\d{9})\b', text):
+        s, e = m.start(1), m.end(1)
+        if any(s < os[1] and os[0] < e for os in occupied):
+            continue
+        entities.append({"type": "VN_PHONE", "start": s, "end": e})
+
+    # EMAIL
+    for m in re.finditer(r'\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b', text):
+        entities.append({"type": "EMAIL", "start": m.start(1), "end": m.end(1)})
+
+    entities = sorted(entities, key=lambda x: (x['start'], x['end'], x['type']))
+    out = []
+    for ent in entities:
+        if not any(o['start']==ent['start'] and o['end']==ent['end'] and o['type']==ent['type'] for o in out):
+            out.append(ent)
+    return out
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    """Redact detected PII by replacing with [REDACTED_<TYPE>] from end to start."""
+    ents = detect(text)
+    result = text
+    for ent in sorted(ents, key=lambda x: x['start'], reverse=True):
+        t = ent['type']
+        result = result[:ent['start']] + f'[REDACTED_{t}]' + result[ent['end']:]
+    return result
