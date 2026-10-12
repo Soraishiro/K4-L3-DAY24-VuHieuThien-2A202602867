@@ -1,8 +1,9 @@
-"""Trifecta split + policy + ledger"""
+"""Tách Run A/Run B, kiểm soát quyền trước công cụ và ghi nhật ký."""
 from __future__ import annotations
 
-import json
+import re
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
 
@@ -13,238 +14,134 @@ from agent.pii import redact
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 
-FUTURE_EXPIRES = "2099-01-01T00:00:00+00:00"
-
-
-def _load_principals():
-    p = Path(__file__).resolve().parent.parent / "data" / "principals.json"
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _get_agent_scopes(principal_id: str) -> tuple:
-    p = _load_principals().get(principal_id)
-    if not p:
-        return ()
-    allowed = p.get("allowed_tools", [])
-    return tuple(allowed)
+# Phạm vi quyền của agent độc lập với quyền của principal mô phỏng.
+AGENT_SCOPES = ("search_docs", "read_customer", "http_post")
+SINK_URL = "http://127.0.0.1:10024/reconcile"
 
 
 def _extract_ticket_ids(docs: List[dict]) -> List[int]:
+    """Chỉ sử dụng tên file ticket do search_docs trả về, không đọc free text."""
     ids = set()
-    for d in docs:
-        name = d.get("id", "")
-        # extract number from filename like ticket-901.md
-        try:
-            # simple parse
-            import re
-            m = re.search(r'ticket-(\d+)', name)
-            if m:
-                ids.add(int(m.group(1)))
-        except Exception:
-            pass
+    for doc in docs:
+        name = doc.get("id")
+        match = re.fullmatch(r"ticket-(\d+)(?:b)?\.md", name or "")
+        if match:
+            ids.add(int(match.group(1)))
     return sorted(ids)
 
 
 def _map_ticket_to_customers(ticket_ids: List[int]) -> List[str]:
-    customers_path = Path(__file__).resolve().parent.parent / "data" / "customers.json"
+    import json
+    path = Path(__file__).resolve().parent.parent / "data" / "customers.json"
     try:
-        customers = json.loads(customers_path.read_text(encoding="utf-8"))
-    except Exception:
+        customers = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return []
-    cids = set()
-    for tid in ticket_ids:
-        for c in customers:
-            related = c.get("related_tickets") or []
-            if tid in related:
-                cids.add(c["customer_id"])
-    return sorted(cids)
+    requested = set(ticket_ids)
+    return sorted({
+        customer["customer_id"]
+        for customer in customers
+        if requested.intersection(customer.get("related_tickets") or [])
+    })
 
 
 def handle(message: str, llm, log_dir: Path | None = None,
-           principal_id: str = "support_l1") -> str:
+           principal_id: str = "support_l1", *,
+           agent_scopes: tuple[str, ...] = AGENT_SCOPES,
+           delegation_depth: int = 0,
+           parent_scopes: tuple[str, ...] = (),
+           expires_at: str | None = None) -> str:
+    """Chạy agent. Mọi công cụ đều được kiểm tra trước khi thực thi.
+
+    Các tùy chọn ủy quyền chỉ phục vụ kiểm thử mô phỏng; CLI không xác thực
+    danh tính thật. Run B không được truyền văn bản của tài liệu từ Run A.
+    """
     agent_id = "lab24-agent"
-    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    run_id = f"run-{uuid.uuid4().hex}"
     ledger_path = (log_dir or REPORTS_DIR) / "ledger.jsonl"
-    principals = _load_principals()
+    deadline = expires_at or (
+        datetime.now(timezone.utc) + timedelta(minutes=15)
+    ).isoformat()
 
-    agent_scopes = _get_agent_scopes(principal_id)
-    parent_scopes = ()
-
-    # Run A: search docs
-    # Policy for search_docs - internal/public, no egress
-    ctx_a = PolicyContext(
-        data_classification="internal",
-        request_purpose="summarize-tickets",
-        agent_owner=f"{agent_id}/{run_id}",
-        delegation_depth=0,
-        egress_enabled=False,
-        principal_id=principal_id,
-        requested_tool="search_docs",
-        agent_scopes=agent_scopes,
-        parent_scopes=parent_scopes,
-        expires_at=FUTURE_EXPIRES,
-    )
-    allow_a, reason_a = policy.check(ctx_a)
-    if allow_a:
-        docs = tools.search_docs(message)
+    def decision(tool: str, classification: str, purpose: str, egress: bool,
+                 arguments: dict) -> bool:
+        ctx = PolicyContext(
+            data_classification=classification,
+            request_purpose=purpose,
+            agent_owner=agent_id,
+            delegation_depth=delegation_depth,
+            egress_enabled=egress,
+            principal_id=principal_id,
+            requested_tool=tool,
+            agent_scopes=agent_scopes,
+            parent_scopes=parent_scopes,
+            expires_at=deadline,
+        )
+        allow, reason = policy.check(ctx)
         ledger.append({
-            "ts": "2026-08-24T00:00:00Z",
+            "ts": datetime.now(timezone.utc).isoformat(),
             "agent_id": agent_id,
             "run_id": run_id,
-            "tool": "search_docs",
-            "args_hash": "deadbeef",
-            "classification": "internal",
-            "decision": "allow",
-            "reason": reason_a or "policy check passed",
+            "tool": tool,
+            "args_hash": ledger.hash_arguments(arguments),
+            "classification": classification,
+            "decision": "allow" if allow else "deny",
+            "reason": reason,
             "on_behalf_of": principal_id,
-            "expires_at": FUTURE_EXPIRES,
+            "expires_at": deadline,
+            "delegation_depth": delegation_depth,
         }, ledger_path)
-    else:
-        docs = []
+        return allow
+
+    def tool_error(tool: str, classification: str, arguments: dict, error: Exception) -> None:
         ledger.append({
-            "ts": "2026-08-24T00:00:00Z",
+            "ts": datetime.now(timezone.utc).isoformat(),
             "agent_id": agent_id,
             "run_id": run_id,
-            "tool": "search_docs",
-            "args_hash": "deadbeef",
-            "classification": "internal",
-            "decision": "deny",
-            "reason": reason_a or "denied",
+            "tool": tool,
+            "args_hash": ledger.hash_arguments(arguments),
+            "classification": classification,
+            "decision": "error",
+            "reason": f"tool execution failed: {type(error).__name__}",
             "on_behalf_of": principal_id,
-            "expires_at": FUTURE_EXPIRES,
+            "expires_at": deadline,
+            "delegation_depth": delegation_depth,
         }, ledger_path)
 
-    # Extract ticket IDs from trusted source (filenames)
-    ticket_ids = _extract_ticket_ids(docs)
+    # Run A: chỉ đọc tài liệu nội bộ/thiếu tin cậy.
+    search_args = {"query": message}
+    docs: List[dict] = []
+    if decision("search_docs", "internal", "summarize-tickets", False, search_args):
+        try:
+            docs = tools.search_docs(message)
+        except Exception as exc:
+            tool_error("search_docs", "internal", search_args, exc)
+            raise
 
-    # Map to customers via trusted mapping
-    customer_ids = _map_ticket_to_customers(ticket_ids)
-
-    # Run B: read customers if allowed
+    # Ranh giới A -> B: chỉ ID ticket trích từ tên file.
+    customer_ids = _map_ticket_to_customers(_extract_ticket_ids(docs))
     collected = []
-    for cid in customer_ids:
-        ctx_b = PolicyContext(
-            data_classification="restricted",
-            request_purpose="support-reply",
-            agent_owner=f"{agent_id}/{run_id}",
-            delegation_depth=0,
-            egress_enabled=False,
-            principal_id=principal_id,
-            requested_tool="read_customer",
-            agent_scopes=agent_scopes,
-            parent_scopes=parent_scopes,
-            expires_at=FUTURE_EXPIRES,
-        )
-        allow_b, reason_b = policy.check(ctx_b)
-        if allow_b:
-            try:
-                rec = tools.read_customer(cid)
-                collected.append(rec)
-                ledger.append({
-                    "ts": "2026-08-24T00:00:00Z",
-                    "agent_id": agent_id,
-                    "run_id": run_id,
-                    "tool": "read_customer",
-                    "args_hash": "deadbeef",
-                    "classification": "restricted",
-                    "decision": "allow",
-                    "reason": reason_b or "policy check passed",
-                    "on_behalf_of": principal_id,
-                    "expires_at": FUTURE_EXPIRES,
-                }, ledger_path)
-            except tools.ToolError:
-                ledger.append({
-                    "ts": "2026-08-24T00:00:00Z",
-                    "agent_id": agent_id,
-                    "run_id": run_id,
-                    "tool": "read_customer",
-                    "args_hash": "deadbeef",
-                    "classification": "restricted",
-                    "decision": "deny",
-                    "reason": "tool error",
-                    "on_behalf_of": principal_id,
-                    "expires_at": FUTURE_EXPIRES,
-                }, ledger_path)
-                continue
-        else:
-            ledger.append({
-                "ts": "2026-08-24T00:00:00Z",
-                "agent_id": agent_id,
-                "run_id": run_id,
-                "tool": "read_customer",
-                "args_hash": "deadbeef",
-                "classification": "restricted",
-                "decision": "deny",
-                "reason": reason_b or "denied",
-                "on_behalf_of": principal_id,
-                "expires_at": FUTURE_EXPIRES,
-            }, ledger_path)
+    for customer_id in customer_ids:
+        read_args = {"customer_id": customer_id}
+        if not decision("read_customer", "restricted", "support-reply", False, read_args):
+            continue
+        try:
+            collected.append(tools.read_customer(customer_id))
+        except tools.ToolError as exc:
+            tool_error("read_customer", "restricted", read_args, exc)
 
-    # Egress: http_post only if policy allows; restricted + egress True is denied by min rule
     if collected:
-        ctx_e = PolicyContext(
-            data_classification="restricted",
-            request_purpose="reconciliation",
-            agent_owner=f"{agent_id}/{run_id}",
-            delegation_depth=0,
-            egress_enabled=True,
-            principal_id=principal_id,
-            requested_tool="http_post",
-            agent_scopes=agent_scopes,
-            parent_scopes=parent_scopes,
-            expires_at=FUTURE_EXPIRES,
-        )
-        allow_e, reason_e = policy.check(ctx_e)
-        if allow_e:
+        body = {"records": collected}
+        send_args = {"url": SINK_URL, "body": body}
+        if decision("http_post", "restricted", "reconciliation", True, send_args):
             try:
-                tools.http_post("http://127.0.0.1:10024/reconcile", {"records": collected})
-                ledger.append({
-                    "ts": "2026-08-24T00:00:00Z",
-                    "agent_id": agent_id,
-                    "run_id": run_id,
-                    "tool": "http_post",
-                    "args_hash": "deadbeef",
-                    "classification": "restricted",
-                    "decision": "allow",
-                    "reason": reason_e or "policy check passed",
-                    "on_behalf_of": principal_id,
-                    "expires_at": FUTURE_EXPIRES,
-                }, ledger_path)
+                tools.http_post(SINK_URL, body)
             except Exception as exc:
-                if "Connection refused" in str(exc) or "Max retries" in str(exc):
-                    raise SystemExit(
-                        "Sink chưa chạy nên agent không POST được.\n"
-                        "Mở một tab khác và chạy:  python sink/sink.py\n"
-                        "(xem README — Setup, tab 1). Đây là lỗi setup, không phải lỗi code của bạn."
-                    ) from None
-                ledger.append({
-                    "ts": "2026-08-24T00:00:00Z",
-                    "agent_id": agent_id,
-                    "run_id": run_id,
-                    "tool": "http_post",
-                    "args_hash": "deadbeef",
-                    "classification": "restricted",
-                    "decision": "deny",
-                    "reason": str(exc),
-                    "on_behalf_of": principal_id,
-                    "expires_at": FUTURE_EXPIRES,
-                }, ledger_path)
-        else:
-            ledger.append({
-                "ts": "2026-08-24T00:00:00Z",
-                "agent_id": agent_id,
-                "run_id": run_id,
-                "tool": "http_post",
-                "args_hash": "deadbeef",
-                "classification": "restricted",
-                "decision": "deny",
-                "reason": reason_e or "denied",
-                "on_behalf_of": principal_id,
-                "expires_at": FUTURE_EXPIRES,
-            }, ledger_path)
+                tool_error("http_post", "restricted", send_args, exc)
+                raise
 
-    # Summarize
-    return llm.summarize(docs)
+    # Luồng tóm tắt tách biệt với Run B; không truyền PII thô sang mô hình.
+    safe_docs = [
+        {"id": d["id"], "text": redact(d["text"])} for d in docs
+    ]
+    return llm.summarize(safe_docs)
