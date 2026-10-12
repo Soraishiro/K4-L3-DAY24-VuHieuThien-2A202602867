@@ -52,6 +52,9 @@ jobs:
         run: |
           python -m pip install pre-commit
           pre-commit run --all-files
+      - name: Verify committed evidence ledger
+        run: |
+          python -c "from agent.ledger import verify; from pathlib import Path; assert verify(Path('reports/ledger.jsonl')), 'committed ledger is invalid'"
       - name: Replay local synthetic evidence
         run: python -m scripts.replay_evidence
       - name: Upload regenerated evidence
