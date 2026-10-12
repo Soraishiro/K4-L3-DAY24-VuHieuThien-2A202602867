@@ -14,6 +14,6 @@ Mọi lệnh thử chỉ chạy với dữ liệu tổng hợp và sink `127.0.0
 - **Baseline trước sửa:** `reports/attack-before.log` (lần chạy cũ) chứa POST `/reconcile` và hồ sơ tổng hợp `KH-000999`. Đây là bằng chứng tấn công tổng hợp, chưa phải bốn lần thử cô lập.
 - **Sau sửa:** `reports/attack-after.log` cũ rỗng; bộ kiểm thử `tests/test_injection.py` phải xác minh đủ 4 biến thể × 2 principal.
 - **Kiểm thử bổ sung:** `tests/test_security_regression.py::test_split_payload_requires_both_documents` kiểm tra hai phần riêng không kích hoạt, kết hợp có kích hoạt. `test_second_lure_has_invisible_characters` kiểm kỹ thuật biến thể 2.
-- **Tái tạo bằng chứng cô lập:** chạy `python scripts/replay_evidence.py` (tạo báo cáo `reports/replay-summary.json` cùng ba file evidence); không gọi API bên ngoài.
+- **Tái tạo bằng chứng cô lập:** chạy `python -m scripts.replay_evidence` (tạo báo cáo `reports/replay-summary.json` cùng ba file evidence); không gọi API bên ngoài.
 
 Không được suy luận từ một log baseline tổng hợp rằng từng biến thể đã kích hoạt độc lập. Chỉ ghi xác nhận sau khi đã chạy kịch bản cô lập. Quy tắc không dùng dữ liệu thật được giữ nguyên.

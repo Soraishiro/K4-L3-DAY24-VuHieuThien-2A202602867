@@ -22,7 +22,7 @@ jobs:
       - name: Check four injection variants
         run: python -m agent.check_lure 'corpus/ticket-90*.md'
       - name: Replay local synthetic evidence
-        run: python scripts/replay_evidence.py
+        run: python -m scripts.replay_evidence
       - name: Upload regenerated evidence
         if: always()
         uses: actions/upload-artifact@v4

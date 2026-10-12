@@ -26,7 +26,7 @@
 python -m pip install --require-hashes -r requirements.lock
 python -m pytest tests/ -q -s
 python -m agent.check_lure corpus/ticket-90*.md
-python scripts/replay_evidence.py
+python -m scripts.replay_evidence
 python -c "from agent.ledger import verify; from pathlib import Path; print(verify(Path('reports/ledger.jsonl')))"
 gitleaks version
 gitleaks git --config .gitleaks.toml --redact --verbose .
