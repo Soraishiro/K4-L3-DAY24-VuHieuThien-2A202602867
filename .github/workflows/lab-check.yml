@@ -12,6 +12,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -21,6 +23,35 @@ jobs:
         run: python -m pytest tests/ -q -s
       - name: Check four injection variants
         run: python -m agent.check_lure 'corpus/ticket-90*.md'
+      - name: Install Gitleaks v8.30.1 (verified release checksum)
+        run: |
+          curl -fsSL -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz' | sha256sum --check
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Check current repository files for secrets
+        run: gitleaks dir --config .gitleaks.toml --redact .
+      - name: Confirm seeded synthetic token in Git history
+        run: |
+          set +e
+          gitleaks git --config .gitleaks.toml --redact --report-format json --report-path /tmp/history-findings.json .
+          result=$?
+          set -e
+          test "$result" -eq 1
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          findings = json.loads(Path('/tmp/history-findings.json').read_text())
+          assert len(findings) == 1, f"expected 1 historical demo finding, got {len(findings)}"
+          assert findings[0].get('RuleID') == 'lab24-synthetic-token'
+          assert findings[0].get('Commit', '').startswith('1bdd849')
+          print("Confirmed one synthetic historical secret and clean current files.")
+          PY
+      - name: Check pre-commit hook
+        run: |
+          python -m pip install pre-commit
+          pre-commit run --all-files
       - name: Replay local synthetic evidence
         run: python -m scripts.replay_evidence
       - name: Upload regenerated evidence
