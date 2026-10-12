@@ -1,53 +1,50 @@
-# Xác minh Day 24 — kết quả kiểm thử thực tế
+# Báo cáo xác minh bài lab Day 24 L3
 
-**Phiên bản kiểm tra:** commit `f3a8518284d43481b12854d65e18438dd637a0af` trên `main`; GitHub Actions run [38263190831](https://github.com/Soraishiro/K4-L3-DAY24-VuHieuThien-2A202602867/actions/runs/38263190831), ngày 12/10/2026. Toàn bộ bước trong workflow hoàn thành thành công.
+**Ngày:** 12/10/2026. **Nguồn xác minh:** [GitHub Actions run 38263808745](https://github.com/Soraishiro/K4-L3-DAY24-VuHieuThien-2A202602867/actions/runs/38263808745), SHA `355a5259cf121a015c404b17285bb83bb549ce5d`, kết luận **success**. Các thay đổi sau SHA này chỉ bổ sung tài liệu.
 
-## Bằng chứng đã có từ lần chạy trước
+## Kết quả thực tế
 
-- `reports/attack-before.log`: có POST `/reconcile` chứa hồ sơ tổng hợp KH-000999.
-- `reports/attack-after.log`: rỗng theo lần chạy cũ.
-- Bộ test PII trên tập 120 dòng/118 thực thể: gold=118, pred=118, tp=118; precision=1.000 và recall=1.000 theo kết quả ghi nhận trước. Không còn dùng giá trị precision=0.554 của lần thử cũ.
-- Lần quét Gitleaks v8.30.1 ghi nhận trong `reports/secrets-incident.md`: token giả tại commit `1bdd849` (mã thoát 1 là dự kiến). Chưa tái chạy Gitleaks trong phiên sửa này.
-- Ledger đã tái tạo có 23 mục, mọi mục có reason và SHA-256 của tham số thực; có 1 quyết định từ chối `http_post`.
+| Nội dung | Kết quả |
+|---|---|
+| Python | 3.11.17 |
+| Cài đặt từ `requirements.lock` với `--require-hashes` | Thành công |
+| Pytest toàn bộ `tests/` | **48 passed**, không có fail hoặc skip trong tổng kết |
+| Độ chính xác PII trên dữ liệu tổng hợp | gold=118, pred=118, TP=118; precision=1.000, recall=1.000 |
+| `agent.check_lure` | **4/4** biến thể đạt |
+| Baseline cô lập cho 4 biến thể | **4/4** gửi hồ sơ tổng hợp KH-000999 đến sink nội bộ |
+| Containment sau sửa | Sink rỗng; `http_post` bị từ chối |
+| Ledger | **23 mục**, hash chain verify thành công; `args_hash` là SHA-256 tham số, không có giá trị giả `deadbeef` |
+| Gitleaks v8.30.1 | Binary kiểm tra SHA-256 đạt; thư mục hiện tại sạch; lịch sử tìm thấy đúng **1 token giả** tại commit `1bdd849` |
+| `pre-commit run --all-files` | Thành công |
 
-## Các chức năng đã kiểm tra trên commit nêu trên
+Workflow cũng kiểm tra trực tiếp tính toàn vẹn của **ledger đã commit**, trước khi tạo bộ minh chứng mới. Lần quét lịch sử Gitleaks trả mã 1 khi tìm thấy token giả theo yêu cầu; đây không phải credential thật.
 
-- Quyền OBO trong `agent/policy.py`: thiếu principal/tool/purpose/TTL bị từ chối, kiểm tra scope giao với parent.
-- `agent/runner.py`: log thời gian UTC, args_hash tính từ tham số, ghi nhận lỗi gọi công cụ; Run A/B chỉ chuyển ticket ID và nhánh tóm tắt được che PII.
-- `agent/ledger.py`: xác minh hash chain, từ chối nối tiếp file đã hỏng.
-- `corpus/ticket-904.md` và `ticket-904b.md`: chỉ khi kết hợp mới kích hoạt.
-- `tests/test_security_regression.py`: kiểm thử hồi quy mới.
-- `scripts/replay_evidence.py`: tái tạo trước/sau và ledger, riêng từng biến thể baseline.
-- `.github/workflows/lab-check.yml`: chạy pytest, kiểm lure, replay và xuất artifact trên GitHub Actions.
+## Tệp minh chứng
 
-## Lệnh bắt buộc để kiểm tra khi chốt bài
+- `reports/attack-before.log`: lần baseline cô lập biến thể 1 có POST đến `/reconcile`.
+- `reports/replay-summary.json`: cả 4 baseline cô lập thành công, sau bảo vệ không có POST.
+- `reports/attack-after.log`: rỗng.
+- `reports/ledger.jsonl`: 23 quyết định và hash chain từ lần tái tạo.
+- `reports/secrets-incident.md`: token giả trong lịch sử.
+- `injection-corpus.md`: phương pháp và kết quả của 4 biến thể.
+- `reports/compliance-mapping.md` và `reports/dpia-lite.md`: đối chiếu rủi ro, văn bản chính thức và giới hạn mock.
+
+## Tái tạo
 
 ```bash
 python -m pip install --require-hashes -r requirements.lock
 python -m pytest tests/ -q -s
 python -m agent.check_lure corpus/ticket-90*.md
 python -m scripts.replay_evidence
-python -c "from agent.ledger import verify; from pathlib import Path; print(verify(Path('reports/ledger.jsonl')))"
+python -c "from pathlib import Path; from agent.ledger import verify; print(verify(Path('reports/ledger.jsonl')))"
 gitleaks version
 gitleaks git --config .gitleaks.toml --redact --verbose .
 gitleaks dir --config .gitleaks.toml .
 pre-commit run --all-files
-git status --short
 ```
 
-GitHub Actions chỉ chạy pytest và replay bằng mock; **không** được mô tả là đã chạy Gitleaks/pre-commit nếu không có log riêng. Việc chạy replay phải dùng dữ liệu tổng hợp và sink localhost; không bật `--model`.
+Mỗi lượt chạy replay tạo thời gian, run ID và hash mới. Chỉ dữ liệu tổng hợp được gửi tới `127.0.0.1:10024` trong phần baseline cố ý không bảo vệ.
 
-Khi có kết quả cuối, ghi: commit SHA, số test pass/fail/skip, phiên bản Python và Gitleaks, kết quả quét lịch sử/hiện tại, kết quả pre-commit và giới hạn chưa kiểm chứng. Đối chiếu đường dẫn tệp minh chứng với commit thật; không dùng thời gian hoặc hash giả làm minh chứng mới.
+## Giới hạn
 
-## Kết quả CI đã xác nhận
-
-- Python 3.11.17; cài `requirements.lock` bằng `--require-hashes` thành công.
-- `python -m pytest tests/ -q -s`: **48 passed**, không có lỗi/skip trong tổng kết.
-- `python -m agent.check_lure 'corpus/ticket-90*.md'`: **4/4** biến thể sẵn sàng.
-- Replay mock cô lập: **4/4** biến thể làm lộ record tổng hợp trước containment; sink **rỗng** sau containment với `dpo`.
-- `ledger.verify`: thành công; **23 mục**, có `http_post` deny và lý do.
-- Gitleaks **v8.30.1**: bản phát hành đã kiểm SHA-256; quét thư mục hiện tại sạch; quét lịch sử phát hiện đúng **1 token giả** theo rule `lab24-synthetic-token` và commit `1bdd849`.
-- `pre-commit run --all-files`: thành công.
-- Tệp nguồn minh chứng: `reports/attack-before.log`, `reports/attack-after.log`, `reports/ledger.jsonl`, `reports/replay-summary.json`. Artifact CI: [Run 38263190831](https://github.com/Soraishiro/K4-L3-DAY24-VuHieuThien-2A202602867/actions/runs/38263190831).
-
-**Giới hạn:** Đây là lab `--mock` trên dữ liệu tổng hợp. Không chứng minh xác thực production, bảo vệ mọi biến thể prompt injection hoặc tuân thủ pháp lý thực tế. Minh chứng trong commit là từ run CI đã nêu; chạy lại sẽ tạo UUID, timestamp và hash khác.
+Kết quả chỉ chứng minh các yêu cầu của bài lab trên mock và tập dữ liệu tổng hợp. `--as` không phải xác thực thật, regex không bảo đảm nhận diện mọi PII ngoài tập kiểm thử, ledger không phát hiện được việc cắt đuôi/viết lại cả file nếu thiếu mốc tin cậy, và tài liệu pháp lý không phải xác nhận tuân thủ của hệ thống sản xuất.
